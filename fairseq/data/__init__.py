@@ -14,6 +14,8 @@ from .add_target_dataset import AddTargetDataset
 from .append_token_dataset import AppendTokenDataset
 from .audio.raw_audio_dataset import BinarizedAudioDataset, FileAudioDataset
 from .audio.hubert_dataset import HubertDataset
+from .audio.hubert_dataset_JSD import HubertDatasetJSD
+from .audio.diar_dataset import DiarDataset
 from .backtranslation_dataset import BacktranslationDataset
 from .bucket_pad_length_dataset import BucketPadLengthDataset
 from .colorize_dataset import ColorizeDataset
@@ -57,7 +59,6 @@ from .shorten_dataset import TruncateDataset, RandomCropDataset
 from .multilingual.sampled_multi_dataset import SampledMultiDataset
 from .multilingual.sampled_multi_epoch_dataset import SampledMultiEpochDataset
 from .fasta_dataset import FastaDataset, EncodedFastaDataset
-from .transform_eos_concat_langpair_dataset import TransformEosConcatLangPairDataset
 
 from .iterators import (
     CountingIterator,
@@ -87,6 +88,7 @@ __all__ = [
     "FileAudioDataset",
     "GroupedIterator",
     "HubertDataset",
+    "HubertDatasetJSD",
     "IdDataset",
     "IndexedCachedDataset",
     "IndexedDataset",
@@ -124,7 +126,6 @@ __all__ = [
     "TokenBlockDataset",
     "TransformEosDataset",
     "TransformEosLangPairDataset",
-    "TransformEosConcatLangPairDataset",
     "TruncateDataset",
     "TruncatedDictionary",
 ]

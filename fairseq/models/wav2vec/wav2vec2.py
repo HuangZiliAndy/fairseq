@@ -3,6 +3,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 import math
 from dataclasses import dataclass, field
 from typing import List, Tuple
@@ -11,11 +12,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from fairseq import utils
 from fairseq.data.data_utils import compute_mask_indices
 from fairseq.dataclass import ChoiceEnum, FairseqDataclass
-from fairseq.distributed import fsdp_wrap
 from fairseq.models import BaseFairseqModel, register_model
 from fairseq.modules import (
     Fp32GroupNorm,
@@ -24,20 +23,17 @@ from fairseq.modules import (
     GumbelVectorQuantizer,
     LayerNorm,
     MultiheadAttention,
-    RelPositionalEncoding,
     SamePad,
     TransposeLast,
 )
-from fairseq.modules.checkpoint_activations import checkpoint_wrapper
-from fairseq.modules.conformer_layer import ConformerWav2Vec2EncoderLayer
 from fairseq.modules.transformer_sentence_encoder import init_bert_params
 from fairseq.utils import buffered_arange, index_put, is_xla_tensor
-
-from .utils import pad_to_multiple
+from fairseq.models.wav2vec.activations import ACT2FN
+import numbers
+from fairseq.modules.quant_noise import quant_noise
 
 EXTRACTOR_MODE_CHOICES = ChoiceEnum(["default", "layer_norm"])
 MASKING_DISTRIBUTION_CHOICES = ChoiceEnum(["static", "uniform", "normal", "poisson"])
-LAYER_TYPE_CHOICES = ChoiceEnum(["transformer", "conformer"])
 
 
 @dataclass
@@ -65,9 +61,7 @@ class Wav2Vec2Config(FairseqDataclass):
     activation_fn: ChoiceEnum(utils.get_available_activation_fns()) = field(
         default="gelu", metadata={"help": "activation function to use"}
     )
-    layer_type: LAYER_TYPE_CHOICES = field(
-        default="transformer", metadata={"help": "layer type in encoder"}
-    )
+
     # dropouts
     dropout: float = field(
         default=0.1, metadata={"help": "dropout probability for the transformer"}
@@ -176,17 +170,6 @@ class Wav2Vec2Config(FairseqDataclass):
         default=1,
         metadata={"help": "min space between spans (if no overlap is enabled)"},
     )
-    require_same_masks: bool = field(
-        default=True,
-        metadata={
-            "help": "whether to number of masked timesteps must be the same across all "
-            "examples in a batch"
-        },
-    )
-    mask_dropout: float = field(
-        default=0.0,
-        metadata={"help": "percent of masks to unmask for each sample"},
-    )
 
     # channel masking
     mask_channel_length: int = field(
@@ -240,10 +223,6 @@ class Wav2Vec2Config(FairseqDataclass):
         default=16,
         metadata={"help": "number of groups for convolutional positional embedding"},
     )
-    pos_conv_depth: int = field(
-        default=1,
-        metadata={"help": "depth of positional encoder network"},
-    )
 
     latent_temp: Tuple[float, float, float] = field(
         default=(2, 0.5, 0.999995),
@@ -252,43 +231,6 @@ class Wav2Vec2Config(FairseqDataclass):
             "can be tuple of 3 values (start, end, decay)"
         },
     )
-    max_positions: int = field(default=100000, metadata={"help": "Max positions"})
-    checkpoint_activations: bool = field(
-        default=False,
-        metadata={"help": "recompute activations and save memory for extra compute"},
-    )
-
-    # FP16 optimization
-    required_seq_len_multiple: int = field(
-        default=2,
-        metadata={
-            "help": "pad the input to encoder such that the sequence length is divisible by multiple"
-        },
-    )
-    crop_seq_to_multiple: int = field(
-        default=1,
-        metadata={
-            "help": "crop convolutional feature extractor output such that the sequence length is divisible by multiple"
-        },
-    )
-
-    # Conformer
-    depthwise_conv_kernel_size: int = field(
-        default=31,
-        metadata={
-            "help": "depthwise-conv-kernel-size for convolution in conformer layer"
-        },
-    )
-    attn_type: str = field(
-        default="",
-        metadata={"help": "if espnet use ESPNET MHA"},
-    )
-    pos_enc_type: str = field(
-        default="abs",
-        metadata={"help": "Positional encoding type to use in conformer"},
-    )
-    fp16: bool = field(default=False, metadata={"help": "If fp16 is being used"})
-
 
 @register_model("wav2vec2", dataclass=Wav2Vec2Config)
 class Wav2Vec2Model(BaseFairseqModel):
@@ -311,8 +253,6 @@ class Wav2Vec2Model(BaseFairseqModel):
             if self.embed != cfg.encoder_embed_dim and not cfg.quantize_input
             else None
         )
-
-        self.crop_seq_to_multiple = cfg.crop_seq_to_multiple
 
         self.mask_prob = cfg.mask_prob
         self.mask_selection = cfg.mask_selection
@@ -385,11 +325,8 @@ class Wav2Vec2Model(BaseFairseqModel):
         self.mask_emb = nn.Parameter(
             torch.FloatTensor(cfg.encoder_embed_dim).uniform_()
         )
-        encoder_cls = TransformerEncoder
-        if cfg.layer_type == "conformer" and cfg.pos_enc_type in ["rel_pos", "rope"]:
-            encoder_cls = ConformerEncoder
 
-        self.encoder = encoder_cls(cfg)
+        self.encoder = TransformerEncoder(cfg)
         self.layer_norm = LayerNorm(self.embed)
 
         self.target_glu = None
@@ -451,8 +388,6 @@ class Wav2Vec2Model(BaseFairseqModel):
                     min_masks=2,
                     no_overlap=self.no_mask_overlap,
                     min_space=self.mask_min_space,
-                    require_same_masks=self.cfg.require_same_masks,
-                    mask_dropout=self.cfg.mask_dropout,
                 )
                 mask_indices = torch.from_numpy(mask_indices).to(x.device)
             x = index_put(x, mask_indices, self.mask_emb)
@@ -524,7 +459,8 @@ class Wav2Vec2Model(BaseFairseqModel):
                 cross_neg_idxs[cross_neg_idxs >= tszs] += 1
 
         if self.n_negatives > 0:
-            neg_idxs = neg_idxs + (torch.arange(bsz).unsqueeze(1) * high)
+            for i in range(1, bsz):
+                neg_idxs[i] += i * high
         else:
             neg_idxs = cross_neg_idxs
 
@@ -545,13 +481,13 @@ class Wav2Vec2Model(BaseFairseqModel):
         y = y.unsqueeze(0)
         targets = torch.cat([y, negatives], dim=0)
 
-        logits = torch.cosine_similarity(x.float(), targets.float(), dim=-1)
+        logits = torch.cosine_similarity(x.float(), targets.float(), dim=-1).type_as(x)
+
         logits = logits / self.logit_temp
-        logits = logits.type_as(x)
 
         if is_xla_tensor(logits) or neg_is_pos.any():
+            fillval = -float(2 ** 30)
             if not hasattr(self, "_inftensor"):
-                fillval = -float(2**30)
                 self._inftensor = (
                     torch.tensor(fillval).to(x.device)
                     if is_xla_tensor(logits)
@@ -625,13 +561,6 @@ class Wav2Vec2Model(BaseFairseqModel):
         else:
             padding_mask = None
 
-        time_steps_to_drop = features.size(1) % self.crop_seq_to_multiple
-        if time_steps_to_drop != 0:
-            features = features[:, :-time_steps_to_drop]
-            unmasked_features = unmasked_features[:, :-time_steps_to_drop]
-            if padding_mask is not None:
-                padding_mask = padding_mask[:, :-time_steps_to_drop]
-
         if self.post_extract_proj is not None:
             features = self.post_extract_proj(features)
 
@@ -683,32 +612,27 @@ class Wav2Vec2Model(BaseFairseqModel):
             }
 
         if self.quantizer:
-            if self.negatives_from_everywhere:
-                q = self.quantizer(unmasked_features, produce_targets=False)
-                y = q["x"]
-                num_vars = q["num_vars"]
-                code_ppl = q["code_perplexity"]
-                prob_ppl = q["prob_perplexity"]
-                curr_temp = q["temp"]
-                y = self.project_q(y)
+            q = self.quantizer(y, produce_targets=False)
+            y = q["x"]
+            num_vars = q["num_vars"]
+            code_ppl = q["code_perplexity"]
+            prob_ppl = q["prob_perplexity"]
+            curr_temp = q["temp"]
 
+            y = self.project_q(y)
+
+            if self.negatives_from_everywhere:
+                neg_cands = self.quantizer(unmasked_features, produce_targets=False)[
+                    "x"
+                ]
                 negs, _ = self.sample_negatives(
-                    y,
-                    mask_indices[0].sum(),
+                    neg_cands,
+                    y.size(1),
                     padding_count=padding_count,
                 )
-                y = y[mask_indices].view(y.size(0), -1, y.size(-1))
+                negs = self.project_q(negs)
 
             else:
-                q = self.quantizer(y, produce_targets=False)
-                y = q["x"]
-                num_vars = q["num_vars"]
-                code_ppl = q["code_perplexity"]
-                prob_ppl = q["prob_perplexity"]
-                curr_temp = q["temp"]
-
-                y = self.project_q(y)
-
                 negs, _ = self.sample_negatives(
                     y,
                     y.size(1),
@@ -804,16 +728,11 @@ class Wav2Vec2Model(BaseFairseqModel):
 
         return pen
 
-    def remove_pretraining_modules(self, last_layer=None):
+    def remove_pretraining_modules(self):
         self.quantizer = None
         self.project_q = None
         self.target_glu = None
         self.final_proj = None
-
-        if last_layer is not None:
-            self.encoder.layers = nn.ModuleList(
-                l for i, l in enumerate(self.encoder.layers) if i <= last_layer
-            )
 
 
 class ConvFeatureExtractionModel(nn.Module):
@@ -897,107 +816,55 @@ class ConvFeatureExtractionModel(nn.Module):
         return x
 
 
-def make_conv_pos(e, k, g):
-    pos_conv = nn.Conv1d(
-        e,
-        e,
-        kernel_size=k,
-        padding=k // 2,
-        groups=g,
-    )
-    dropout = 0
-    std = math.sqrt((4 * (1.0 - dropout)) / (k * e))
-    nn.init.normal_(pos_conv.weight, mean=0, std=std)
-    nn.init.constant_(pos_conv.bias, 0)
-
-    pos_conv = nn.utils.weight_norm(pos_conv, name="weight", dim=2)
-    pos_conv = nn.Sequential(pos_conv, SamePad(k), nn.GELU())
-
-    return pos_conv
-
-
 class TransformerEncoder(nn.Module):
-    def build_encoder_layer(self, args: Wav2Vec2Config):
-        if args.layer_type == "transformer":
-            layer = TransformerSentenceEncoderLayer(
-                embedding_dim=self.embedding_dim,
-                ffn_embedding_dim=args.encoder_ffn_embed_dim,
-                num_attention_heads=args.encoder_attention_heads,
-                dropout=self.dropout,
-                attention_dropout=args.attention_dropout,
-                activation_dropout=args.activation_dropout,
-                activation_fn=args.activation_fn,
-                layer_norm_first=args.layer_norm_first,
-            )
-        elif args.layer_type == "conformer":
-            layer = ConformerWav2Vec2EncoderLayer(
-                embed_dim=self.embedding_dim,
-                ffn_embed_dim=args.encoder_ffn_embed_dim,
-                attention_heads=args.encoder_attention_heads,
-                dropout=args.dropout,
-                depthwise_conv_kernel_size=args.depthwise_conv_kernel_size,
-                activation_fn="swish",
-                attn_type=args.attn_type,
-                use_fp16=args.fp16,
-                pos_enc_type="abs",
-            )
-        layer = fsdp_wrap(layer)
-        if args.checkpoint_activations:
-            layer = checkpoint_wrapper(layer)
-        return layer
-
-    def __init__(self, args: Wav2Vec2Config):
+    def __init__(self, args):
         super().__init__()
 
         self.dropout = args.dropout
         self.embedding_dim = args.encoder_embed_dim
-        self.required_seq_len_multiple = args.required_seq_len_multiple
 
-        pos_conv_depth = getattr(args, "pos_conv_depth", 1)
-        if pos_conv_depth > 1:
-            num_layers = args.pos_conv_depth
-            k = max(3, args.conv_pos // num_layers)
+        self.pos_conv = nn.Conv1d(
+            self.embedding_dim,
+            self.embedding_dim,
+            kernel_size=args.conv_pos,
+            padding=args.conv_pos // 2,
+            groups=args.conv_pos_groups,
+        )
+        dropout = 0
+        std = math.sqrt((4 * (1.0 - dropout)) / (args.conv_pos * self.embedding_dim))
+        nn.init.normal_(self.pos_conv.weight, mean=0, std=std)
+        nn.init.constant_(self.pos_conv.bias, 0)
 
-            def make_conv_block(e, k, g, l):
-                return nn.Sequential(
-                    *[
-                        nn.Sequential(
-                            nn.Conv1d(
-                                e,
-                                e,
-                                kernel_size=k,
-                                padding=k // 2,
-                                groups=g,
-                            ),
-                            SamePad(k),
-                            TransposeLast(),
-                            LayerNorm(e, elementwise_affine=False),
-                            TransposeLast(),
-                            nn.GELU(),
-                        )
-                        for _ in range(l)
-                    ]
-                )
-
-            self.pos_conv = make_conv_block(
-                self.embedding_dim, k, args.conv_pos_groups, num_layers
-            )
-
-        else:
-            self.pos_conv = make_conv_pos(
-                self.embedding_dim,
-                args.conv_pos,
-                args.conv_pos_groups,
-            )
+        self.pos_conv = nn.utils.weight_norm(self.pos_conv, name="weight", dim=2)
+        self.pos_conv = nn.Sequential(self.pos_conv, SamePad(args.conv_pos), nn.GELU())
 
         self.layers = nn.ModuleList(
-            [self.build_encoder_layer(args) for _ in range(args.encoder_layers)]
+            [
+                TransformerSentenceEncoderLayer(
+                    embedding_dim=self.embedding_dim,
+                    ffn_embedding_dim=args.encoder_ffn_embed_dim,
+                    num_attention_heads=args.encoder_attention_heads,
+                    dropout=self.dropout,
+                    attention_dropout=args.attention_dropout,
+                    activation_dropout=args.activation_dropout,
+                    activation_fn=args.activation_fn,
+                    layer_norm_first=args.layer_norm_first,
+                    add_adapter=args.add_adapter,
+                    adapter_size=args.adapter_size,
+                    adapter_act=args.adapter_act,
+                    adapter_init_range=args.adapter_init_range,
+                )
+                for _ in range(args.encoder_layers)
+            ]
         )
+
         self.layer_norm_first = args.layer_norm_first
         self.layer_norm = LayerNorm(self.embedding_dim)
         self.layerdrop = args.encoder_layerdrop
 
-        self.apply(init_bert_params)
+        # Modified by Zili. We don't initialize parameters here
+        # since we will load pretrained weights
+        #self.apply(init_bert_params)
 
     def forward(self, x, padding_mask=None, layer=None):
         x, layer_results = self.extract_features(x, padding_mask, layer)
@@ -1007,13 +874,7 @@ class TransformerEncoder(nn.Module):
 
         return x, layer_results
 
-    def extract_features(
-        self,
-        x,
-        padding_mask=None,
-        tgt_layer=None,
-        min_layer=0,
-    ):
+    def extract_features(self, x, padding_mask=None, tgt_layer=None):
 
         if padding_mask is not None:
             x = index_put(x, padding_mask, 0)
@@ -1025,138 +886,17 @@ class TransformerEncoder(nn.Module):
         if not self.layer_norm_first:
             x = self.layer_norm(x)
 
-        # pad to the sequence length dimension
-        x, pad_length = pad_to_multiple(
-            x, self.required_seq_len_multiple, dim=-2, value=0
-        )
-        if pad_length > 0 and padding_mask is None:
-            padding_mask = x.new_zeros((x.size(0), x.size(1)), dtype=torch.bool)
-            padding_mask[:, -pad_length:] = True
-        else:
-            padding_mask, _ = pad_to_multiple(
-                padding_mask, self.required_seq_len_multiple, dim=-1, value=True
-            )
         x = F.dropout(x, p=self.dropout, training=self.training)
 
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
-
-        layer_results = []
-        r = None
-        for i, layer in enumerate(self.layers):
-            dropout_probability = np.random.random() if self.layerdrop > 0 else 1
-            if not self.training or (dropout_probability > self.layerdrop):
-                x, (z, lr) = layer(
-                    x, self_attn_padding_mask=padding_mask, need_weights=False
-                )
-                if i >= min_layer:
-                    layer_results.append((x, z, lr))
-            if i == tgt_layer:
-                r = x
-                break
-
-        if r is not None:
-            x = r
-
-        # T x B x C -> B x T x C
-        x = x.transpose(0, 1)
-
-        # undo paddding
-        if pad_length > 0:
-            x = x[:, :-pad_length]
-
-            def undo_pad(a, b, c):
-                return (
-                    a[:-pad_length],
-                    b[:-pad_length] if b is not None else b,
-                    c[:-pad_length],
-                )
-
-            layer_results = [undo_pad(*u) for u in layer_results]
-
-        return x, layer_results
-
-    def max_positions(self):
-        """Maximum output length supported by the encoder."""
-        return self.args.max_positions
-
-    def upgrade_state_dict_named(self, state_dict, name):
-        """Upgrade a (possibly old) state dict for new versions of fairseq."""
-        return state_dict
-
-
-class ConformerEncoder(TransformerEncoder):
-    def build_encoder_layer(self, args):
-        layer = ConformerWav2Vec2EncoderLayer(
-            embed_dim=self.embedding_dim,
-            ffn_embed_dim=args.encoder_ffn_embed_dim,
-            attention_heads=args.encoder_attention_heads,
-            dropout=args.dropout,
-            depthwise_conv_kernel_size=args.depthwise_conv_kernel_size,
-            activation_fn="swish",
-            attn_type=args.attn_type,
-            pos_enc_type=args.pos_enc_type,
-            use_fp16=args.fp16,  # only used for rope
-        )
-        layer = fsdp_wrap(layer)
-        if args.checkpoint_activations:
-            layer = checkpoint_wrapper(layer)
-        return layer
-
-    def __init__(self, args):
-        super().__init__(args)
-        self.args = args
-        self.dropout = args.dropout
-        self.embedding_dim = args.encoder_embed_dim
-        self.pos_enc_type = args.pos_enc_type
-        max_source_positions = self.max_positions()
-
-        if self.pos_enc_type == "rel_pos":
-            self.embed_positions = RelPositionalEncoding(
-                max_source_positions, self.embedding_dim
-            )
-        elif self.pos_enc_type == "rope":
-            self.embed_positions = None
-        else:
-            raise Exception("Unsupported positional encoding type")
-
-        self.layers = nn.ModuleList(
-            [self.build_encoder_layer(args) for _ in range(args.encoder_layers)]
-        )
-        self.layer_norm_first = args.layer_norm_first
-        self.layer_norm = LayerNorm(self.embedding_dim)
-        self.layerdrop = args.encoder_layerdrop
-
-        self.apply(init_bert_params)
-
-    def extract_features(self, x, padding_mask=None, tgt_layer=None):
-        if padding_mask is not None:
-            x = index_put(x, padding_mask, 0)
-
-        # B x T x C -> T x B x C
-        x = x.transpose(0, 1)
-
-        # B X T X C here
-        position_emb = None
-        if self.pos_enc_type == "rel_pos":
-            position_emb = self.embed_positions(x)
-
-        if not self.layer_norm_first:
-            x = self.layer_norm(x)
-
-        x = F.dropout(x, p=self.dropout, training=self.training)
 
         layer_results = []
         r = None
         for i, layer in enumerate(self.layers):
             dropout_probability = np.random.random()
             if not self.training or (dropout_probability > self.layerdrop):
-                x, z = layer(
-                    x,
-                    self_attn_padding_mask=padding_mask,
-                    need_weights=False,
-                    position_emb=position_emb,
-                )
+                x, z = layer(x, self_attn_padding_mask=padding_mask, need_weights=False)
                 if tgt_layer is not None:
                     layer_results.append((x, z))
             if i == tgt_layer:
@@ -1171,6 +911,168 @@ class ConformerEncoder(TransformerEncoder):
 
         return x, layer_results
 
+    def max_positions(self):
+        """Maximum output length supported by the encoder."""
+        return self.args.max_positions
+
+    def upgrade_state_dict_named(self, state_dict, name):
+        """Upgrade a (possibly old) state dict for new versions of fairseq."""
+        return state_dict
+
+class SpkAwareTransformerEncoder(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+
+        self.args = args
+        self.dropout = args.dropout
+        self.embedding_dim = args.encoder_embed_dim
+
+        self.pos_conv = nn.Conv1d(
+            self.embedding_dim,
+            self.embedding_dim,
+            kernel_size=args.conv_pos,
+            padding=args.conv_pos // 2,
+            groups=args.conv_pos_groups,
+        )
+        dropout = 0
+        std = math.sqrt((4 * (1.0 - dropout)) / (args.conv_pos * self.embedding_dim))
+        nn.init.normal_(self.pos_conv.weight, mean=0, std=std)
+        nn.init.constant_(self.pos_conv.bias, 0)
+
+        self.pos_conv = nn.utils.weight_norm(self.pos_conv, name="weight", dim=2)
+        self.pos_conv = nn.Sequential(self.pos_conv, SamePad(args.conv_pos), nn.GELU())
+
+        self.spk_embed = args.spk_embed
+        self.spk_method = args.spk_method
+        spk_layers, cat_layers = args.spk_layers, args.cat_layers
+        self.init_linear = args.init_linear
+        #assert spk_layers[0] == '[' and spk_layers[-1] == ']'
+        #spk_layers = spk_layers[1: -1].split(',')
+        spk_layers = spk_layers.split('_')
+        spk_layers = [int(l) for l in spk_layers]
+        self.spk_layers = spk_layers
+        cat_layers = cat_layers.split('_')
+        cat_layers = [int(l) for l in cat_layers]
+        self.cat_layers = cat_layers
+        for l in self.cat_layers:
+            assert l in self.spk_layers
+        self.keep_spk_layers = args.keep_spk_layers
+        self.ln_after_adapt = args.ln_after_adapt
+
+        layers = []
+        for i in range(args.encoder_layers):
+            if i not in self.spk_layers:
+                layers.append(
+                        TransformerSentenceEncoderLayer(
+                            embedding_dim=self.embedding_dim,
+                            ffn_embedding_dim=args.encoder_ffn_embed_dim,
+                            num_attention_heads=args.encoder_attention_heads,
+                            dropout=self.dropout,
+                            attention_dropout=args.attention_dropout,
+                            activation_dropout=args.activation_dropout,
+                            activation_fn=args.activation_fn,
+                            layer_norm_first=args.layer_norm_first,
+                            add_adapter=False,
+                            adapter_size=args.adapter_size,
+                            adapter_act=args.adapter_act,
+                            adapter_init_range=args.adapter_init_range,
+                        )
+                )
+            else:
+                layers.append(
+                        SpkAwareTransformerSentenceEncoderLayer(
+                            embedding_dim=self.embedding_dim,
+                            ffn_embedding_dim=args.encoder_ffn_embed_dim,
+                            num_attention_heads=args.encoder_attention_heads,
+                            dropout=self.dropout,
+                            attention_dropout=args.attention_dropout,
+                            activation_dropout=args.activation_dropout,
+                            activation_fn=args.activation_fn,
+                            layer_norm_first=args.layer_norm_first,
+                            spkembed_dim=self.spk_embed,
+                            method=self.spk_method if i in self.cat_layers else "None",
+                            init_linear=self.init_linear,
+                            ln_after_adapt=self.ln_after_adapt,
+                            add_adapter=args.add_adapter,
+                            adapter_size=args.adapter_size,
+                            adapter_act=args.adapter_act,
+                            adapter_init_range=args.adapter_init_range,
+                            adapter_method=args.adapter_method,
+                            cln=args.cln,
+                            cln_bias=args.cln_bias,
+                            cattn=args.cattn,
+                        )
+                )
+
+        self.layers = nn.ModuleList(layers)
+        self.layer_norm_first = args.layer_norm_first
+        self.layer_norm = LayerNorm(self.embedding_dim)
+        self.layerdrop = args.encoder_layerdrop
+
+        # Modified by Zili. We don't initialize parameters here
+        # since we will load pretrained weights
+        #self.apply(init_bert_params)
+
+    def forward(self, x, padding_mask=None, embed=None, layer=None):
+        x, layer_results = self.extract_features(x, padding_mask, embed, layer)
+
+        if self.layer_norm_first and layer is None:
+            x = self.layer_norm(x)
+
+        return x, layer_results
+
+    def extract_features(self, x, padding_mask=None, embed=None, tgt_layer=None):
+
+        if padding_mask is not None:
+            x = index_put(x, padding_mask, 0)
+
+        x_conv = self.pos_conv(x.transpose(1, 2))
+        x_conv = x_conv.transpose(1, 2)
+        x = x + x_conv
+
+        if not self.layer_norm_first:
+            x = self.layer_norm(x)
+
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        # B x T x C -> T x B x C
+        x = x.transpose(0, 1)
+
+        layer_results = []
+        r = None
+        for i, layer in enumerate(self.layers):
+            dropout_probability = np.random.random()
+            if isinstance(layer, SpkAwareTransformerSentenceEncoderLayer):
+                if self.keep_spk_layers and i in self.cat_layers:
+                    dropout_probability = 1.0
+            if not self.training or (dropout_probability > self.layerdrop):
+
+                if isinstance(layer, SpkAwareTransformerSentenceEncoderLayer):
+                    x, z = layer(x, self_attn_padding_mask=padding_mask, embed=embed, need_weights=False, save_dir=None)
+                else:
+                    x, z = layer(x, self_attn_padding_mask=padding_mask, need_weights=False, save_dir=None)
+
+                if tgt_layer is not None:
+                    layer_results.append((x, z))
+            if i == tgt_layer:
+                r = x
+                break
+
+        if r is not None:
+            x = r
+
+        # T x B x C -> B x T x C
+        x = x.transpose(0, 1)
+
+        return x, layer_results
+
+    def max_positions(self):
+        """Maximum output length supported by the encoder."""
+        return self.args.max_positions
+
+    def upgrade_state_dict_named(self, state_dict, name):
+        """Upgrade a (possibly old) state dict for new versions of fairseq."""
+        return state_dict
 
 class TransformerSentenceEncoderLayer(nn.Module):
     """
@@ -1182,12 +1084,16 @@ class TransformerSentenceEncoderLayer(nn.Module):
         self,
         embedding_dim: float = 768,
         ffn_embedding_dim: float = 3072,
-        num_attention_heads: int = 8,
+        num_attention_heads: float = 8,
         dropout: float = 0.1,
         attention_dropout: float = 0.1,
         activation_dropout: float = 0.1,
         activation_fn: str = "relu",
         layer_norm_first: bool = False,
+        add_adapter: bool=False,
+        adapter_size: int=-1,
+        adapter_act: str="swish",
+        adapter_init_range: float=1e-3,
     ) -> None:
 
         super().__init__()
@@ -1219,6 +1125,14 @@ class TransformerSentenceEncoderLayer(nn.Module):
         # layer norm associated with the position wise feed-forward NN
         self.final_layer_norm = LayerNorm(self.embedding_dim)
 
+        # whether to add adapter to the transformer layers
+        self.add_adapter = add_adapter
+        if self.add_adapter:
+            self.adapter1 = Adapter(hidden_size=embedding_dim, adapter_size=adapter_size, adapter_act=adapter_act, adapter_initializer_range=adapter_init_range)
+            self.adapter2 = Adapter(hidden_size=embedding_dim, adapter_size=adapter_size, adapter_act=adapter_act, adapter_initializer_range=adapter_init_range)
+        else:
+            self.adapter1, self.adapter2 = None, None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1226,6 +1140,7 @@ class TransformerSentenceEncoderLayer(nn.Module):
         self_attn_padding_mask: torch.Tensor = None,
         need_weights: bool = False,
         att_args=None,
+        save_dir=None,
     ):
         """
         LayerNorm is applied either before or after the self-attention/ffn
@@ -1241,7 +1156,6 @@ class TransformerSentenceEncoderLayer(nn.Module):
                 value=x,
                 key_padding_mask=self_attn_padding_mask,
                 attn_mask=self_attn_mask,
-                need_weights=False,
             )
             x = self.dropout1(x)
             x = residual + x
@@ -1251,9 +1165,6 @@ class TransformerSentenceEncoderLayer(nn.Module):
             x = self.activation_fn(self.fc1(x))
             x = self.dropout2(x)
             x = self.fc2(x)
-
-            layer_result = x
-
             x = self.dropout3(x)
             x = residual + x
         else:
@@ -1262,10 +1173,12 @@ class TransformerSentenceEncoderLayer(nn.Module):
                 key=x,
                 value=x,
                 key_padding_mask=self_attn_padding_mask,
-                need_weights=False,
+                need_head_weights=True,
             )
 
             x = self.dropout1(x)
+            if self.add_adapter:
+                x = self.adapter1(x)
             x = residual + x
 
             x = self.self_attn_layer_norm(x)
@@ -1274,11 +1187,392 @@ class TransformerSentenceEncoderLayer(nn.Module):
             x = self.activation_fn(self.fc1(x))
             x = self.dropout2(x)
             x = self.fc2(x)
-
-            layer_result = x
-
             x = self.dropout3(x)
+            if self.add_adapter:
+                x = self.adapter2(x)
             x = residual + x
             x = self.final_layer_norm(x)
 
-        return x, (attn, layer_result)
+        return x, attn
+
+class SpkAwareTransformerSentenceEncoderLayer(nn.Module):
+    """
+    Implements a Transformer Encoder Layer used in BERT/XLM style pre-trained
+    models.
+    """
+
+    def __init__(
+        self,
+        embedding_dim: float = 768,
+        ffn_embedding_dim: float = 3072,
+        num_attention_heads: float = 8,
+        dropout: float = 0.1,
+        attention_dropout: float = 0.1,
+        activation_dropout: float = 0.1,
+        activation_fn: str = "relu",
+        layer_norm_first: bool = False,
+        spkembed_dim: float=256,
+        method: str="cat",
+        init_linear: bool=False,
+        ln_after_adapt: bool=False,
+        add_adapter: bool=False,
+        adapter_size: int=-1,
+        adapter_act: str="swish",
+        adapter_init_range: float=1e-3,
+        adapter_method: str="standard",
+        cln: bool=False,
+        cln_bias: bool=False,
+        cattn: bool=False,
+    ) -> None:
+
+        super().__init__()
+        # Initialize parameters
+        self.embedding_dim = embedding_dim
+        self.dropout = dropout
+        self.activation_dropout = activation_dropout
+        self.spkembed_dim = spkembed_dim
+        assert method in ["cat", "additive", "additive1", "FiLM", "None"]
+        self.method = method
+        self.init_linear = init_linear
+
+        if self.method == "cat":
+            self.fc0 = nn.Linear(self.embedding_dim + self.spkembed_dim, self.embedding_dim)
+        elif self.method == "additive":
+            self.fc0 = nn.Linear(self.spkembed_dim, self.embedding_dim)
+        elif self.method == "additive1":
+            hidden_dim = 256
+            self.fc_embed0 = nn.Linear(self.spkembed_dim, hidden_dim)
+            self.fc_embed1 = nn.Linear(hidden_dim, self.embedding_dim)
+        elif self.method == "FiLM":
+            self.film = FiLM(self.embedding_dim, self.spkembed_dim)
+        elif self.method == "None":
+            pass
+        else:
+            raise ValueError("Method not defined.")
+
+        self.ln_after_adapt = ln_after_adapt
+        self.cln, self.cln_bias = cln, cln_bias
+        if self.ln_after_adapt:
+            if not self.cln:
+                self.layer_norm_after_adapt = LayerNorm(self.embedding_dim)
+            else:
+                self.layer_norm_after_adapt = ConditionalLayerNorm(self.embedding_dim, self.spkembed_dim, modulate_bias=self.cln_bias)
+
+        # Initialize blocks
+        self.activation_fn = utils.get_activation_fn(activation_fn)
+        self.self_attn = MultiheadAttention(
+            self.embedding_dim,
+            num_attention_heads,
+            dropout=attention_dropout,
+            self_attention=True,
+        )
+
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(self.activation_dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+        self.layer_norm_first = layer_norm_first
+
+        # layer norm associated with the self attention layer
+        if not self.cln:
+            self.self_attn_layer_norm = LayerNorm(self.embedding_dim)
+        else:
+            self.self_attn_layer_norm = ConditionalLayerNorm(self.embedding_dim, self.spkembed_dim, modulate_bias=self.cln_bias)
+        self.fc1 = nn.Linear(self.embedding_dim, ffn_embedding_dim)
+        self.fc2 = nn.Linear(ffn_embedding_dim, self.embedding_dim)
+
+        # layer norm associated with the position wise feed-forward NN
+        if not self.cln:
+            self.final_layer_norm = LayerNorm(self.embedding_dim)
+        else:
+            self.final_layer_norm = ConditionalLayerNorm(self.embedding_dim, self.spkembed_dim, modulate_bias=self.cln_bias)
+
+        self.add_adapter = add_adapter
+        self.adapter_method = adapter_method
+        if not self.add_adapter:
+            self.adapter1, self.adapter2 = None, None
+        else:
+            self.adapter1 = SpkAdapter(hidden_size=embedding_dim, embed_size=self.spkembed_dim, adapter_size=adapter_size, adapter_act=adapter_act, adapter_initializer_range=adapter_init_range, method=adapter_method)
+            self.adapter2 = SpkAdapter(hidden_size=embedding_dim, embed_size=self.spkembed_dim, adapter_size=adapter_size, adapter_act=adapter_act, adapter_initializer_range=adapter_init_range, method=adapter_method)
+
+        if self.init_linear:
+            self.init_linear_parameters()
+
+        self.cattn = cattn
+        if not self.cattn:
+            self.k_film = None
+            self.q_film = None
+            self.v_film = None
+        else:
+            self.k_film = FiLM(self.embedding_dim, self.spkembed_dim)
+            self.q_film = FiLM(self.embedding_dim, self.spkembed_dim)
+            self.v_film = FiLM(self.embedding_dim, self.spkembed_dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        embed: torch.Tensor,
+        self_attn_mask: torch.Tensor = None,
+        self_attn_padding_mask: torch.Tensor = None,
+        need_weights: bool = False,
+        att_args=None,
+        save_dir=None,
+    ):
+        """
+        LayerNorm is applied either before or after the self-attention/ffn
+        modules similar to the original Transformer imlementation.
+        """
+        if self.method == "cat":
+            embed_t = (torch.unsqueeze(embed, 0)).expand(x.size(0), -1, -1)
+            y = torch.cat([x, embed_t], 2)
+            x = x + self.fc0(y)
+        elif self.method == "additive":
+            embed_t = (torch.unsqueeze(embed, 0)).expand(x.size(0), -1, -1)
+            x = x + self.fc0(embed_t)
+        elif self.method == "additive1":
+            embed_t = (torch.unsqueeze(embed, 0)).expand(x.size(0), -1, -1)
+            embed_t = self.fc_embed1(F.gelu(self.fc_embed0(embed_t)))
+            x = x + embed_t
+        elif self.method == "FiLM":
+            x = self.film(embed, x)
+        elif self.method == "None":
+            pass
+
+        if self.ln_after_adapt:
+            if not self.cln:
+                x = self.layer_norm_after_adapt(x)
+            else:
+                x = self.layer_norm_after_adapt(x, embed)
+
+        residual = x
+
+        if self.layer_norm_first:
+            x = self.self_attn_layer_norm(x)
+            x, attn = self.self_attn(
+                query=x,
+                key=x,
+                value=x,
+                key_padding_mask=self_attn_padding_mask,
+                attn_mask=self_attn_mask,
+            )
+            x = self.dropout1(x)
+            x = residual + x
+
+            residual = x
+            x = self.final_layer_norm(x)
+            x = self.activation_fn(self.fc1(x))
+            x = self.dropout2(x)
+            x = self.fc2(x)
+            x = self.dropout3(x)
+            x = residual + x
+        else:
+            if not self.cattn:
+                x, attn = self.self_attn(
+                    query=x,
+                    key=x,
+                    value=x,
+                    key_padding_mask=self_attn_padding_mask,
+                    need_head_weights=True,
+                )
+            else:
+                x, attn = self.self_attn(
+                    query=self.q_film(embed, x),
+                    key=self.k_film(embed, x),
+                    value=self.v_film(embed, x),
+                    key_padding_mask=self_attn_padding_mask,
+                    need_head_weights=True,
+                )
+
+            x = self.dropout1(x)
+            if self.add_adapter:
+                x = self.adapter1(x, embed)
+            x = residual + x
+
+            if not self.cln:
+                x = self.self_attn_layer_norm(x)
+            else:
+                x = self.self_attn_layer_norm(x, embed)
+
+            residual = x
+            x = self.activation_fn(self.fc1(x))
+            x = self.dropout2(x)
+            x = self.fc2(x)
+            x = self.dropout3(x)
+            if self.add_adapter:
+                x = self.adapter2(x, embed)
+            x = residual + x
+            if not self.cln:
+                x = self.final_layer_norm(x)
+            else:
+                x = self.final_layer_norm(x, embed)
+
+        return x, attn
+
+    def init_linear_parameters(self):
+        if self.method == "cat":
+            nn.init.normal_(self.fc0.weight, std=1e-3)
+            nn.init.zeros_(self.fc0.bias)
+        elif self.method == "additive":
+            nn.init.normal_(self.fc0.weight, std=1e-3)
+            nn.init.zeros_(self.fc0.bias)
+        elif self.method == "additive1":
+            nn.init.normal_(self.fc_embed0.weight, std=1e-3)
+            nn.init.zeros_(self.fc_embed0.bias)
+            nn.init.normal_(self.fc_embed1.weight, std=1e-3)
+            nn.init.zeros_(self.fc_embed1.bias)
+        elif self.method == "FiLM" or self.method == "None":
+            pass
+        else:
+            raise ValueError("Initialization method not defined.")
+
+class Adapter(nn.Module):
+    def __init__(
+            self,
+            hidden_size,
+            adapter_size,
+            adapter_act,
+            adapter_initializer_range,
+        ):
+        super(Adapter, self).__init__()
+        self.down_project = nn.Linear(hidden_size, adapter_size)
+        nn.init.normal_(self.down_project.weight, std=adapter_initializer_range)
+        nn.init.zeros_(self.down_project.bias)
+
+        if isinstance(adapter_act, str):
+            self.activation = ACT2FN[adapter_act]
+        else:
+            self.activation = adapter_act
+
+        self.up_project = nn.Linear(adapter_size, hidden_size)
+        nn.init.normal_(self.up_project.weight, std=adapter_initializer_range)
+        nn.init.zeros_(self.up_project.bias)
+
+    def forward(self, hidden_states: torch.Tensor):
+        down_projected = self.down_project(hidden_states)
+        activated = self.activation(down_projected)
+        up_projected = self.up_project(activated)
+        return hidden_states + up_projected
+
+class SpkAdapter(nn.Module):
+    def __init__(
+            self,
+            hidden_size,
+            embed_size,
+            adapter_size,
+            adapter_act,
+            adapter_initializer_range,
+            method,
+        ):
+        super(SpkAdapter, self).__init__()
+        assert method in ["standard", "FiLM"]
+        self.method = method
+        self.down_project = nn.Linear(hidden_size, adapter_size)
+        nn.init.normal_(self.down_project.weight, std=adapter_initializer_range)
+        nn.init.zeros_(self.down_project.bias)
+
+        if isinstance(adapter_act, str):
+            self.activation = ACT2FN[adapter_act]
+        else:
+            self.activation = adapter_act
+
+        self.up_project = nn.Linear(adapter_size, hidden_size)
+        nn.init.normal_(self.up_project.weight, std=adapter_initializer_range)
+        nn.init.zeros_(self.up_project.bias)
+
+        self.modulate = None
+        if self.method == "FiLM":
+            self.modulate = FiLM(hidden_size, embed_size)
+
+    def forward(self, hidden_states: torch.Tensor, embed: torch.Tensor):
+        down_projected = self.down_project(hidden_states)
+        activated = self.activation(down_projected)
+        up_projected = self.up_project(activated)
+        if self.method == "standard":
+            pass
+        elif self.method == "FiLM":
+            up_projected = self.modulate(embed, up_projected)
+
+        return hidden_states + up_projected
+
+class FiLM(nn.Module):
+    """ Feature-wise Linear Modulation (FiLM) layer"""
+    def __init__(self, feat_size, embed_size, num_film_layers=1, layer_norm=False):
+        super(FiLM, self).__init__()
+        self.feat_size = feat_size
+        self.embed_size = embed_size
+        self.num_film_layers = num_film_layers
+        self.layer_norm = nn.LayerNorm(output_size) if layer_norm else None
+        gamma_fcs, beta_fcs = [], []
+        for i in range(num_film_layers):
+            if i == 0:
+                gamma_fcs.append(nn.Linear(embed_size, feat_size))
+                beta_fcs.append(nn.Linear(embed_size, feat_size))
+            else:
+                gamma_fcs.append(nn.Linear(feat_size, feat_size))
+                beta_fcs.append(nn.Linear(feat_size, feat_size))
+        self.gamma_fcs = nn.ModuleList(gamma_fcs)
+        self.beta_fcs = nn.ModuleList(beta_fcs)
+        self.init_weights()
+
+    def init_weights(self):
+        for i in range(self.num_film_layers):
+            nn.init.zeros_(self.gamma_fcs[i].weight)
+            nn.init.zeros_(self.gamma_fcs[i].bias)
+            nn.init.zeros_(self.beta_fcs[i].weight)
+            nn.init.zeros_(self.beta_fcs[i].bias)
+
+    def forward(self, embed, x):
+        gamma, beta = None, None
+        for i in range(len(self.gamma_fcs)):
+            if i == 0:
+                gamma = self.gamma_fcs[i](embed)
+                beta = self.beta_fcs[i](embed)
+            else:
+                gamma = self.gamma_fcs[i](gamma)
+                beta = self.beta_fcs[i](beta)
+        gamma = gamma.expand_as(x)
+        beta = beta.expand_as(x)
+        x = (1 + gamma) * x + beta
+        if self.layer_norm is not None:
+            x = self.layer_norm(x)
+        return x
+
+class ConditionalLayerNorm(nn.Module):
+    def __init__(self, normalized_shape, embed_dim, modulate_bias=False, eps=1e-5):
+        super(ConditionalLayerNorm, self).__init__()
+        if isinstance(normalized_shape, numbers.Integral):
+            normalized_shape = (normalized_shape,)
+        self.normalized_shape = tuple(normalized_shape)
+
+        self.embed_dim = embed_dim
+        self.eps = eps
+
+        self.weight = nn.Parameter(torch.empty(*normalized_shape))
+        self.bias = nn.Parameter(torch.empty(*normalized_shape))
+        assert len(normalized_shape) == 1
+        self.ln_weight_modulation = FiLM(normalized_shape[0], embed_dim)
+        self.modulate_bias = modulate_bias
+        if self.modulate_bias:
+            self.ln_bias_modulation = FiLM(normalized_shape[0], embed_dim)
+        else:
+            self.ln_bias_modulation = None
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.ones_(self.weight)
+        nn.init.zeros_(self.bias)
+
+    def forward(self, input, embed):
+        mean = torch.mean(input, -1, keepdim=True)
+        var = torch.var(input, -1, unbiased=False, keepdim=True)
+        weight = self.ln_weight_modulation(embed, self.weight.expand(embed.size(0), -1))
+        if self.ln_bias_modulation is None:
+            bias = self.bias
+        else:
+            bias = self.ln_bias_modulation(embed, self.bias.expand(embed.size(0), -1))
+        res = (input - mean) / torch.sqrt(var + self.eps) * weight + bias
+        return res
+
+    def extra_repr(self):
+        return '{normalized_shape}, {embed_dim}, modulate_bias={modulate_bias}, eps={eps}'.format(**self.__dict__)

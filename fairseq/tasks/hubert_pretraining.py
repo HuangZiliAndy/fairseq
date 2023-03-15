@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from dataclasses import dataclass, field
-from fairseq.data import Dictionary, HubertDataset
+from fairseq.data import Dictionary, HubertDataset, HubertDatasetJSD
 from fairseq.dataclass.configs import FairseqDataclass
 from fairseq.tasks import register_task
 from fairseq.tasks.fairseq_task import FairseqTask
@@ -28,15 +28,15 @@ class LabelEncoder(object):
 
     def __call__(self, label: str) -> List[str]:
         return self.dictionary.encode_line(
-            label,
-            append_eos=False,
-            add_if_not_exist=False,
+            label, append_eos=False, add_if_not_exist=False,
         )
 
 
 @dataclass
 class HubertPretrainingConfig(FairseqDataclass):
-    data: str = field(default=MISSING, metadata={"help": "path to data directory"})
+    data: str = field(
+        default=MISSING, metadata={"help": "path to data directory"}
+    )
     fine_tuning: bool = field(
         default=False, metadata={"help": "set to true if fine-tuning Hubert"}
     )
@@ -55,9 +55,15 @@ class HubertPretrainingConfig(FairseqDataclass):
             "help": "if set, looks for labels in this directory instead",
         },
     )
-    label_rate: float = field(
-        default=-1.0,
-        metadata={"help": "label frame rate. -1.0 for sequence label"},
+    label_rate: int = field(
+        default=-1,
+        metadata={"help": "label frame rate. -1 for sequence label"},
+    )
+    embed_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "speaker embeddings directory",
+        },
     )
     sample_rate: int = field(
         default=16_000,
@@ -68,7 +74,9 @@ class HubertPretrainingConfig(FairseqDataclass):
     )
     normalize: bool = field(
         default=False,
-        metadata={"help": "if set, normalizes input to have 0 mean and unit variance"},
+        metadata={
+            "help": "if set, normalizes input to have 0 mean and unit variance"
+        },
     )
     enable_padding: bool = field(
         default=False,
@@ -89,7 +97,8 @@ class HubertPretrainingConfig(FairseqDataclass):
     single_target: Optional[bool] = field(
         default=False,
         metadata={
-            "help": "if set, AddTargetDatasets outputs same keys " "as AddTargetDataset"
+            "help": "if set, AddTargetDatasets outputs same keys "
+            "as AddTargetDataset"
         },
     )
     random_crop: Optional[bool] = field(
@@ -99,6 +108,18 @@ class HubertPretrainingConfig(FairseqDataclass):
     pad_audio: Optional[bool] = field(
         default=False,
         metadata={"help": "pad audio to the longest one in the batch if true"},
+    )
+    JSD: Optional[bool] = field(
+        default=False,
+        metadata={"help": "joint speaker detection"},
+    )
+    spkfield: Optional[int] = field(
+        default=1,
+        metadata={"help": "get the speaker from audio name"},
+    )
+    nspks: Optional[int] = field(
+        default=1,
+        metadata={"help": "number of speakers"},
     )
 
 
@@ -146,10 +167,7 @@ class HubertPretrainingTask(FairseqTask):
 
     def load_dictionaries(self):
         label_dir = self.cfg.data if self.cfg.label_dir is None else self.cfg.label_dir
-        dictionaries = [
-            Dictionary.load(f"{label_dir}/dict.{label}.txt")
-            for label in self.cfg.labels
-        ]
+        dictionaries = [Dictionary.load(f"{label_dir}/dict.{label}.txt") for label in self.cfg.labels]
         return dictionaries[0] if self.cfg.fine_tuning else dictionaries
 
     def get_label_dir(self) -> str:
@@ -163,29 +181,74 @@ class HubertPretrainingTask(FairseqTask):
         pad_list = [dict.pad() for dict in dicts]
         eos_list = [dict.eos() for dict in dicts]
         procs = [LabelEncoder(dict) for dict in dicts]
-        paths = [f"{self.get_label_dir()}/{split}.{l}" for l in self.cfg.labels]
+        paths = [
+            f"{self.get_label_dir()}/{split}.{l}" for l in self.cfg.labels
+        ]
+
+        if self.cfg.embed_dir is None or self.cfg.embed_dir == 'None':
+            embed_dir = None
+        else:
+            assert int("train" in split) + int("dev" in split) + int("test" in split or "eval" in split) == 1
+            if "train" in split:
+                embed_dir = "{}/train".format(self.cfg.embed_dir)
+                shuffle_spk = True
+            elif "dev" in split:
+                embed_dir = "{}/dev".format(self.cfg.embed_dir)
+                shuffle_spk = False
+            elif "test" in split or "eval" in split:
+                if "test" in split:
+                    embed_dir = "{}/test".format(self.cfg.embed_dir)
+                elif "eval" in split:
+                    embed_dir = "{}/eval".format(self.cfg.embed_dir)
+                shuffle_spk = False
 
         # hubert v1: pad_audio=True, random_crop=False;
-        self.datasets[split] = HubertDataset(
-            manifest,
-            sample_rate=self.cfg.sample_rate,
-            label_paths=paths,
-            label_rates=self.cfg.label_rate,
-            pad_list=pad_list,
-            eos_list=eos_list,
-            label_processors=procs,
-            max_keep_sample_size=self.cfg.max_keep_size,
-            min_keep_sample_size=self.cfg.min_sample_size,
-            max_sample_size=self.cfg.max_sample_size,
-            pad_audio=self.cfg.pad_audio,
-            normalize=self.cfg.normalize,
-            store_labels=False,
-            random_crop=self.cfg.random_crop,
-            single_target=self.cfg.single_target,
-        )
+        if not self.cfg.JSD:
+            self.datasets[split] = HubertDataset(
+                manifest,
+                sample_rate=self.cfg.sample_rate,
+                label_paths=paths,
+                label_rates=self.cfg.label_rate,
+                embed_dir=embed_dir,
+                pad_list=pad_list,
+                eos_list=eos_list,
+                label_processors=procs,
+                max_keep_sample_size=self.cfg.max_keep_size,
+                min_keep_sample_size=self.cfg.min_sample_size,
+                max_sample_size=self.cfg.max_sample_size,
+                pad_audio=self.cfg.pad_audio,
+                normalize=self.cfg.normalize,
+                store_labels=False,
+                random_crop=self.cfg.random_crop,
+                single_target=self.cfg.single_target,
+                spkfield=self.cfg.spkfield,
+            )
+        else:
+            self.datasets[split] = HubertDatasetJSD(
+                manifest,
+                sample_rate=self.cfg.sample_rate,
+                label_paths=paths,
+                label_rates=self.cfg.label_rate,
+                embed_dir=embed_dir,
+                pad_list=pad_list,
+                eos_list=eos_list,
+                label_processors=procs,
+                max_keep_sample_size=self.cfg.max_keep_size,
+                min_keep_sample_size=self.cfg.min_sample_size,
+                max_sample_size=self.cfg.max_sample_size,
+                pad_audio=self.cfg.pad_audio,
+                normalize=self.cfg.normalize,
+                store_labels=False,
+                random_crop=self.cfg.random_crop,
+                single_target=self.cfg.single_target,
+                nspks=self.cfg.nspks,
+                shuffle_spk=shuffle_spk,
+            )
 
     def max_positions(self) -> Tuple[int, int]:
         return (sys.maxsize, sys.maxsize)
 
-    def filter_indices_by_size(self, indices: np.array, *args, **kwargs) -> np.array:
+    def filter_indices_by_size(
+        self, indices: np.array, *args, **kwargs
+    ) -> np.array:
         return indices

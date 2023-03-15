@@ -18,11 +18,11 @@ from fairseq.models.hubert.hubert import MASKING_DISTRIBUTION_CHOICES
 from fairseq.tasks import FairseqTask
 from omegaconf import II, MISSING, open_dict
 from fairseq.modules.layer_norm import FusedLayerNorm
-from fairseq.models.wav2vec.wav2vec2 import Adapter, SpkAdapter, TransformerSentenceEncoderLayer
-from fairseq.modules.transformer_sentence_encoder import init_bert_params
+from fairseq.models.wav2vec.wav2vec2 import Adapter, SpkAdapter
+
 
 @dataclass
-class HubertAsrConfig(FairseqDataclass):
+class HubertDiarConfig(FairseqDataclass):
     w2v_path: str = field(
         default=MISSING, metadata={"help": "path to hubert model"}
     )
@@ -57,6 +57,11 @@ class HubertAsrConfig(FairseqDataclass):
             "help": "dropout probability after activation in FFN "
             "inside hubert model"
         },
+    )
+
+    # number of speakers
+    n_spks: int = field(
+        default=1, metadata={"help": "number of speakers"}
     )
 
     # masking
@@ -122,18 +127,6 @@ class HubertAsrConfig(FairseqDataclass):
     cattn: bool = field(
         default=False, metadata={"help": "Conditional self-attention"},
     )
-    nspks: int = field(
-        default=1, metadata={"help": "number of speakers, if nspks > 1, we will use JSD"},
-    )
-    JSD_layers: int = field(
-        default=0, metadata={"help": "number of JSD layers"},
-    )
-    encoder_layers_finetune: int = field(
-        default=12, metadata={"help": "number of encoder layers used in the finetuning stage"},
-    )
-    PIT: bool = field(
-        default=False, metadata={"help": "PIT"},
-    )
 
     # adapter module
     add_adapter: bool = field(
@@ -197,127 +190,50 @@ class HubertAsrConfig(FairseqDataclass):
 
 
 @dataclass
-class HubertCtcConfig(HubertAsrConfig):
+class HubertProjConfig(HubertDiarConfig):
     pass
 
 
-@register_model("hubert_ctc", dataclass=HubertCtcConfig)
-class HubertCtc(BaseFairseqModel):
-    def __init__(self, cfg: HubertCtcConfig, w2v_encoder: BaseFairseqModel):
+@register_model("hubert_proj", dataclass=HubertProjConfig)
+class HubertProj(BaseFairseqModel):
+    def __init__(self, cfg: HubertProjConfig, w2v_encoder: BaseFairseqModel):
         super().__init__()
         self.cfg = cfg
         self.w2v_encoder = w2v_encoder
-
-        #if cfg["add_adapter"]:
-        #    for param in self.w2v_encoder.parameters():
-        #        param.requires_grad = False
-        #
-        #    for name, sub_module in self.w2v_encoder.named_modules():
-        #        if isinstance(sub_module, (FusedLayerNorm, Adapter, SpkAdapter)):
-        #            for param_name, param in sub_module.named_parameters():
-        #                param.requires_grad = True
-        #        if name == "proj" and isinstance(sub_module, nn.Linear):
-        #            for param_name, param in sub_module.named_parameters():
-        #                param.requires_grad = True
-
-        #for name, param in self.w2v_encoder.named_parameters():
-        #    if param.requires_grad:
-        #        print(name, param.size())
 
     def upgrade_state_dict_named(self, state_dict, name):
         super().upgrade_state_dict_named(state_dict, name)
         return state_dict
 
     @classmethod
-    def build_model(cls, cfg: HubertCtcConfig, task: FairseqTask):
+    def build_model(cls, cfg: HubertProjConfig, task: FairseqTask):
         """Build a new model instance."""
-        w2v_encoder = HubertEncoder(cfg, task.target_dictionary)
+        w2v_encoder = HubertEncoder(cfg)
         return cls(cfg, w2v_encoder)
 
     def get_normalized_probs(self, net_output, log_probs):
         """Get normalized probabilities (or log probs) from a net's output."""
 
+        assert not log_probs
         logits = net_output["encoder_out"]
-        if log_probs:
-            return utils.log_softmax(logits.float(), dim=-1)
-        else:
-            return utils.softmax(logits.float(), dim=-1)
+        return torch.sigmoid(logits)
 
-    def get_logits(self, net_output):
-        logits = net_output["encoder_out"]
-        padding = net_output["encoder_padding_mask"]
-        if padding is not None and padding.any():
-            padding = padding.T
-            logits[padding][..., 0] = 0
-            logits[padding][..., 1:] = float("-inf")
+    #def get_logits(self, net_output):
+    #    logits = net_output["encoder_out"]
+    #    padding = net_output["encoder_padding_mask"]
+    #    if padding is not None and padding.any():
+    #        padding = padding.T
+    #        logits[padding][..., 0] = 0
+    #        logits[padding][..., 1:] = float("-inf")
 
-        return logits
+    #    return logits
 
     def forward(self, **kwargs):
         x = self.w2v_encoder(**kwargs)
         return x
 
-
-@dataclass
-class HubertSeq2SeqConfig(HubertAsrConfig):
-    decoder_embed_dim: int = field(
-        default=768, metadata={"help": "decoder embedding dimension"}
-    )
-    decoder_ffn_embed_dim: int = field(
-        default=3072, metadata={"help": "decoder embedding dimension for FFN"}
-    )
-    decoder_layers: int = field(
-        default=6, metadata={"help": "num of decoder layers"}
-    )
-    decoder_layerdrop: float = field(
-        default=0.0, metadata={"help": "decoder layerdrop chance"}
-    )
-    decoder_attention_heads: int = field(
-        default=4, metadata={"help": "num decoder attention heads"}
-    )
-    decoder_learned_pos: bool = field(
-        default=False,
-        metadata={"help": "use learned positional embeddings in the decoder"},
-    )
-    decoder_normalize_before: bool = field(
-        default=False,
-        metadata={"help": "apply layernorm before each decoder block"},
-    )
-    no_token_positional_embeddings: bool = field(
-        default=False,
-        metadata={
-            "help": "if set, disables positional embeddings "
-            "(outside self attention)"
-        },
-    )
-    decoder_dropout: float = field(
-        default=0.0, metadata={"help": "dropout probability in the decoder"}
-    )
-    decoder_attention_dropout: float = field(
-        default=0.0,
-        metadata={
-            "help": "dropout probability for attention weights "
-            "inside the decoder"
-        },
-    )
-    decoder_activation_dropout: float = field(
-        default=0.0,
-        metadata={
-            "help": "dropout probability after activation in FFN "
-            "inside the decoder"
-        },
-    )
-    max_target_positions: int = field(
-        default=2048, metadata={"help": "max target positions"}
-    )
-    share_decoder_input_output_embed: bool = field(
-        default=False,
-        metadata={"help": "share decoder input and output embeddings"},
-    )
-
-
 class HubertEncoder(FairseqEncoder):
-    def __init__(self, cfg: HubertAsrConfig, tgt_dict=None):
+    def __init__(self, cfg: HubertDiarConfig):
         self.apply_mask = cfg.apply_mask
 
         arg_overrides = {
@@ -353,8 +269,7 @@ class HubertEncoder(FairseqEncoder):
             "adapter_act": cfg.adapter_act,
             "adapter_init_range": cfg.adapter_init_range,
             "adapter_method": cfg.adapter_method,
-            "encoder_layers": cfg.encoder_layers_finetune,
-            "PIT": cfg.PIT,
+            "n_spks": cfg.n_spks
         }
 
         if cfg.w2v_args is None:
@@ -373,85 +288,38 @@ class HubertEncoder(FairseqEncoder):
                     w2v_args
                 )
 
-        if len(state) == 2 and 'cfg' in state and 'model' in state:
-            from fairseq.models.wavlm.WavLM import WavLMConfig, WavLM
-            wavlm_cfg = WavLMConfig(state['cfg'])
-            model = WavLM(wavlm_cfg)
-            missing_keys, unexpected_keys = model.load_state_dict(state['model'], strict=False)
+        assert cfg.normalize == w2v_args.task.normalize, (
+            "Fine-tuning works best when data normalization is the same. "
+            "Please check that --normalize is set or unset for "
+            "both pre-training and here"
+        )
+
+        w2v_args.task.data = cfg.data
+        task = tasks.setup_task(w2v_args.task)
+        if state is not None and "task_state" in state:
+            # This will load the stored "dictionaries" object
+            task.load_state_dict(state["task_state"])
+
+        model = task.build_model(w2v_args.model)
+
+        if state is not None and not cfg.no_pretrained_weights:
+            # set strict=False because we omit some modules
+            missing_keys, unexpected_keys = model.load_state_dict(state["model"], strict=False)
             print("Missing keys {}, unexpected keys {}".format(missing_keys, unexpected_keys))
-            model.feature_grad_mult = cfg.feature_grad_mult
-            model.encoder.layerdrop = cfg.layerdrop
-            super().__init__(None)
-            d = state['cfg']['encoder_embed_dim']
-            self.w2v_model = model
-        else:
-            assert cfg.normalize == w2v_args.task.normalize, (
-                "Fine-tuning works best when data normalization is the same. "
-                "Please check that --normalize is set or unset for "
-                "both pre-training and here"
-            )
 
-            w2v_args.task.data = cfg.data
-            task = tasks.setup_task(w2v_args.task)
-            if state is not None and "task_state" in state:
-                # This will load the stored "dictionaries" object
-                task.load_state_dict(state["task_state"])
+        model.remove_pretraining_modules()
 
-            model = task.build_model(w2v_args.model)
+        super().__init__(task.source_dictionary)
 
-            if state is not None and not cfg.no_pretrained_weights:
-                # set strict=False because we omit some modules
-                missing_keys, unexpected_keys = model.load_state_dict(state["model"], strict=False)
-                print("Missing keys {}, unexpected keys {}".format(missing_keys, unexpected_keys))
+        d = w2v_args.model.encoder_embed_dim
 
-            model.remove_pretraining_modules()
-
-            super().__init__(task.source_dictionary)
-
-            d = w2v_args.model.encoder_embed_dim
-
-            self.w2v_model = model
+        self.w2v_model = model
 
         self.final_dropout = nn.Dropout(cfg.final_dropout)
         self.freeze_finetune_updates = cfg.freeze_finetune_updates
         self.num_updates = 0
-        self.nspks = cfg.nspks
-        self.JSD_layers = cfg.JSD_layers
-        self.PIT = cfg.PIT
 
-        if self.nspks == 1 or self.JSD_layers == 0:
-            self.JSD = None
-        elif self.nspks > 1 and self.JSD_layers > 0:
-            self.JSD = []
-            self.JSD.append(nn.Linear(cfg.w2v_args.encoder_embed_dim * self.nspks, cfg.w2v_args.encoder_embed_dim))
-            for i in range(self.JSD_layers):
-                self.JSD.append(
-                    TransformerSentenceEncoderLayer(
-                        embedding_dim=cfg.w2v_args.encoder_embed_dim,
-                        ffn_embedding_dim=cfg.w2v_args.encoder_ffn_embed_dim,
-                        num_attention_heads=cfg.w2v_args.encoder_attention_heads,
-                        dropout=cfg.w2v_args.dropout,
-                        attention_dropout=cfg.w2v_args.attention_dropout,
-                        activation_dropout=cfg.w2v_args.activation_dropout,
-                        activation_fn=cfg.w2v_args.activation_fn,
-                        layer_norm_first=cfg.w2v_args.layer_norm_first,
-                        #add_adapter=False,
-                        #adapter_size=args.adapter_size,
-                        #adapter_act=args.adapter_act,
-                        #adapter_init_range=args.adapter_init_range,
-                    )
-                )
-            self.JSD = nn.ModuleList(self.JSD)
-            self.JSD.apply(init_bert_params)
-        else:
-            raise ValueError("Condition not defined.")
-
-        if tgt_dict is not None:
-            self.proj = Linear(d, len(tgt_dict) * cfg.nspks)
-        elif getattr(cfg, "decoder_embed_dim", d) != d:
-            self.proj = Linear(d, cfg.decoder_embed_dim)
-        else:
-            self.proj = None
+        self.proj = Linear(d, cfg.n_spks)
 
     def set_num_updates(self, num_updates):
         """Set the number of parameters updates."""
@@ -476,62 +344,33 @@ class HubertEncoder(FairseqEncoder):
                 # B x T x C -> T x B x C
                 x = x.transpose(0, 1)
 
-        #print('-' * 80)
-        #print("x", x.size())
-        #print("self.JSD", self.JSD)
-        if self.PIT:
-            idx = list(range(0, x.size(1), self.nspks))
-            x = x[:, idx, :]
-
-        if self.JSD is not None:
-            assert tbc and x.size(1) % self.nspks == 0
-            x = x.view(x.size(0), -1, self.nspks, x.size(2))
-            x = x.view(x.size(0), x.size(1), -1)
-            for layer in self.JSD:
-                if isinstance(layer, nn.Linear):
-                    x = layer(x)
-                elif isinstance(layer, TransformerSentenceEncoderLayer):
-                    mask_idx = [t for t in range(0, padding_mask.size(0), self.nspks)]
-                    x, z = layer(x, self_attn_padding_mask=padding_mask[mask_idx, :], need_weights=False)
-                else:
-                    raise ValueError("Condition not defined.")
-
         x = self.final_dropout(x)
 
-        if self.proj:
-            x = self.proj(x)
-
-        if self.nspks > 1:
-            x = x.view(x.size(0), x.size(1), self.nspks, -1)
-            x = x.view(x.size(0), -1, x.size(3))
-
-        #print("x", x.size())
-        #print("padding_mask", padding_mask.size())
+        x = self.proj(x)
 
         return {
             "encoder_out": x,  # T x B x C
             "encoder_padding_mask": padding_mask,  # B x T
             "padding_mask": padding_mask,
-            "nspks": self.nspks,
         }
 
-    def reorder_encoder_out(self, encoder_out, new_order):
-        if encoder_out["encoder_out"] is not None:
-            encoder_out["encoder_out"] = encoder_out[
-                "encoder_out"
-            ].index_select(1, new_order)
-        if encoder_out["encoder_padding_mask"] is not None:
-            encoder_out["encoder_padding_mask"] = encoder_out[
-                "encoder_padding_mask"
-            ].index_select(0, new_order)
-        return encoder_out
+    #def reorder_encoder_out(self, encoder_out, new_order):
+    #    if encoder_out["encoder_out"] is not None:
+    #        encoder_out["encoder_out"] = encoder_out[
+    #            "encoder_out"
+    #        ].index_select(1, new_order)
+    #    if encoder_out["encoder_padding_mask"] is not None:
+    #        encoder_out["encoder_padding_mask"] = encoder_out[
+    #            "encoder_padding_mask"
+    #        ].index_select(0, new_order)
+    #    return encoder_out
 
-    def max_positions(self):
-        """Maximum input length supported by the encoder."""
-        return None
+    #def max_positions(self):
+    #    """Maximum input length supported by the encoder."""
+    #    return None
 
-    def upgrade_state_dict_named(self, state_dict, name):
-        return state_dict
+    #def upgrade_state_dict_named(self, state_dict, name):
+    #    return state_dict
 
 
 def Embedding(num_embeddings, embedding_dim, padding_idx):

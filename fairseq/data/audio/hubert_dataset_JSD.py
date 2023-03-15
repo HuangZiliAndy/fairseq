@@ -116,7 +116,7 @@ def verify_label_lengths(
         )
 
 
-class HubertDataset(FairseqDataset):
+class HubertDatasetJSD(FairseqDataset):
     def __init__(
         self,
         manifest_path: str,
@@ -136,7 +136,8 @@ class HubertDataset(FairseqDataset):
         store_labels: bool = True,
         random_crop: bool = False,
         single_target: bool = False,
-        spkfield: int = 1,
+        nspks: int = 2,
+        shuffle_spk: bool = False,
     ):
         self.audio_root, self.audio_names, inds, tot, self.sizes = load_audio(
             manifest_path, max_keep_sample_size, min_keep_sample_size
@@ -154,7 +155,7 @@ class HubertDataset(FairseqDataset):
         if embed_dir is None:
             self.spk2emb = None
         else:
-            self.spk2emb = load_spk_embed(embed_dir)
+            self.spk2emb = load_spk_embed(embed_dir) 
             logger.info("Loaded embeddings for {} speakers, embedding dimension {}".format(len(self.spk2emb), list(self.spk2emb.values())[0].shape[1]))
 
         self.label_rates = (
@@ -184,7 +185,8 @@ class HubertDataset(FairseqDataset):
         )
         self.pad_audio = pad_audio
         self.normalize = normalize
-        self.spkfield = spkfield
+        self.nspks = nspks
+        self.shuffle_spk = shuffle_spk
         logger.info(
             f"pad_audio={pad_audio}, random_crop={random_crop}, "
             f"normalize={normalize}, max_sample_size={self.max_sample_size}"
@@ -207,9 +209,12 @@ class HubertDataset(FairseqDataset):
                 offset_s, offset_e = self.label_offsets_list[label_idx][index]
                 f.seek(offset_s)
                 label = f.read(offset_e - offset_s)
+        label = label.strip('\n').split('#')
+        #assert len(label) == self.nspks
+        label = [l.split(None, 1)[1] for l in label]
 
         if self.label_processors is not None:
-            label = self.label_processors[label_idx](label)
+            label = [self.label_processors[label_idx](l) for l in label]
         return label
 
     def get_labels(self, index):
@@ -219,15 +224,23 @@ class HubertDataset(FairseqDataset):
         if self.spk2emb is None:
             return None
         else:
-            audio_name = (self.audio_names[index]).split('/')[-1]
-            #spk = audio_name.split('-')[0]
-            #if '_' in spk:
-            #    spk = spk.split('_')[0]
-
-            spk = '-'.join(audio_name.split('-')[:self.spkfield])
-
-            assert spk in self.spk2emb, "Speaker name not in dictionary"
-            embed = self.spk2emb[spk]
+            #audio_name = (self.audio_names[index]).split('/')[-1]
+            #audio_name = '-'.join(audio_name.split('-')[1:])
+            #audio_name = audio_name.split('_')
+            #spks = [a.split('-')[0] for a in audio_name]
+            #assert len(spks) == self.nspks
+            #embed = [self.spk2emb[spk] for spk in spks] 
+            #embed = np.concatenate(embed, 0)
+            #embed = torch.from_numpy(embed).float()
+            #return embed
+            with open(self.label_paths[0]) as f:
+                offset_s, offset_e = self.label_offsets_list[0][index]
+                f.seek(offset_s)
+                label = f.read(offset_e - offset_s)
+            label = label.strip('\n').split('#')
+            spks = [(l.split(None, 1)[0])[1:-1] for l in label]
+            embed = [self.spk2emb[spk] for spk in spks] 
+            embed = np.concatenate(embed, 0)
             embed = torch.from_numpy(embed).float()
             return embed
 
@@ -236,6 +249,32 @@ class HubertDataset(FairseqDataset):
         wav = self.get_audio(index)
         labels = self.get_labels(index)
         embed = self.get_embed(index)
+        assert len(labels[0]) == embed.size(0)
+        if embed.size(0) < self.nspks:
+            embed_pad = torch.zeros(self.nspks, embed.size(1)).type_as(embed)
+            embed_pad[:embed.size(0), :] = torch.clone(embed)
+            embed = embed_pad
+            for _ in range(self.nspks - len(labels[0])):
+                labels[0].append(torch.tensor([4]).type_as(labels[0][0]))
+        elif embed.size(0) > self.nspks:
+            assert embed.size(0) - self.nspks == 1
+            label_len = [len(l) for l in labels[0]]
+            min_label_len = min(label_len)
+            min_idx = np.random.choice([i for i in range(len(label_len)) if label_len[i] == min_label_len], 1)[0]
+            select_idx = [i for i in range(embed.size(0)) if i != min_idx]
+            embed = embed[select_idx, :]
+            labels[0] = [labels[0][i] for i in select_idx]
+
+        assert embed.size(0) == self.nspks
+        assert len(labels[0]) == self.nspks
+
+        # randomly shuffle the speakers
+        if self.shuffle_spk:
+            perm = np.random.permutation(self.nspks)
+        else:
+            perm = np.array(list(range(self.nspks)))
+        embed = embed[perm, :]
+        labels = [[labels[0][p] for p in perm]]
         return {"id": index, "source": wav, "label_list": labels, "embed": embed, "wavfile": wavfile}
 
     def __len__(self):
@@ -260,8 +299,9 @@ class HubertDataset(FairseqDataset):
         if len(samples) == 0:
             return {}
 
-        audios = [s["source"] for s in samples]
+        audios = [s["source"] for s in samples for _ in range(self.nspks)]
         audio_sizes = [len(s) for s in audios]
+
         if self.pad_audio:
             audio_size = min(max(audio_sizes), self.max_sample_size)
         else:
@@ -270,30 +310,21 @@ class HubertDataset(FairseqDataset):
             audios, audio_size
         )
 
-        #def get_spkid(fname):
-        #    fname = fname.split('/')[-1]
-        #    spk = fname.split('-')[0]
-        #    return [spk]
-        #print('-' * 80)
-        #print("audio_sizes", audio_sizes)
-        #print("wavfile", [s["wavfile"] for s in samples])
-        #print("spks", [get_spkid(s["wavfile"]) for s in samples])
-
         targets_by_label = [
-            [s["label_list"][i] for s in samples]
+            [s["label_list"][i][j] for s in samples for j in range(self.nspks)]
             for i in range(self.num_labels)
         ]
         targets_list, lengths_list, ntokens_list = self.collater_label(
             targets_by_label, audio_size, audio_starts
         )
-
+        
         embeds = [s["embed"] for s in samples]
         collated_embeds = self.collater_embed(embeds)
 
         net_input = {"source": collated_audios, "padding_mask": padding_mask, "embed": collated_embeds}
         batch = {
-            "id": torch.LongTensor([s["id"] for s in samples]),
-            "wavfile": [s["wavfile"] for s in samples],
+            "id": torch.LongTensor([s["id"] for s in samples for _ in range(self.nspks)]),
+            "wavfile": [s["wavfile"] for s in samples for _ in range(self.nspks)],
             "net_input": net_input,
         }
 
@@ -382,15 +413,15 @@ class HubertDataset(FairseqDataset):
             collated_embeds = None
         else:
             collated_embeds = torch.cat(embeds, 0)
-        return collated_embeds
+        return collated_embeds 
 
     def num_tokens(self, index):
         return self.size(index)
 
     def size(self, index):
         if self.pad_audio:
-            return self.sizes[index]
-        return min(self.sizes[index], self.max_sample_size)
+            return self.sizes[index] * self.nspks
+        return min(self.sizes[index], self.max_sample_size) * self.nspks
 
     def ordered_indices(self):
         if self.shuffle:
@@ -413,3 +444,4 @@ class HubertDataset(FairseqDataset):
             with torch.no_grad():
                 wav = F.layer_norm(wav, wav.shape)
         return wav
+

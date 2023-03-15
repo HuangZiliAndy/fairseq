@@ -4,38 +4,41 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+
 import torch
 import torch.nn as nn
-from omegaconf import II
-
+from dataclasses import dataclass, field
 from fairseq import utils
 from fairseq.data.data_utils import compute_mask_indices
 from fairseq.data.dictionary import Dictionary
 from fairseq.dataclass import ChoiceEnum, FairseqDataclass
 from fairseq.models import BaseFairseqModel, register_model
 from fairseq.models.wav2vec.wav2vec2 import (
-    EXTRACTOR_MODE_CHOICES,
-    MASKING_DISTRIBUTION_CHOICES,
-    LAYER_TYPE_CHOICES,
     ConvFeatureExtractionModel,
     TransformerEncoder,
+    SpkAwareTransformerEncoder,
 )
 from fairseq.modules import GradMultiply, LayerNorm
 from fairseq.tasks.hubert_pretraining import (
     HubertPretrainingConfig,
     HubertPretrainingTask,
 )
+from omegaconf import II
 
 logger = logging.getLogger(__name__)
+
+EXTRACTOR_MODE_CHOICES = ChoiceEnum(["default", "layer_norm"])
+MASKING_DISTRIBUTION_CHOICES = ChoiceEnum(
+    ["static", "uniform", "normal", "poisson"]
+)
 
 
 @dataclass
 class HubertConfig(FairseqDataclass):
-    label_rate: float = II("task.label_rate")
+    label_rate: int = II("task.label_rate")
 
     extractor_mode: EXTRACTOR_MODE_CHOICES = field(
         default="default",
@@ -59,9 +62,6 @@ class HubertConfig(FairseqDataclass):
     )
     activation_fn: ChoiceEnum(utils.get_available_activation_fns()) = field(
         default="gelu", metadata={"help": "activation function to use"}
-    )
-    layer_type: LAYER_TYPE_CHOICES = field(
-        default="transformer", metadata={"help": "layer type in encoder"}
     )
 
     # dropouts
@@ -87,7 +87,9 @@ class HubertConfig(FairseqDataclass):
     )
     dropout_features: float = field(
         default=0.0,
-        metadata={"help": "dropout to apply to the features (after feat extr)"},
+        metadata={
+            "help": "dropout to apply to the features (after feat extr)"
+        },
     )
 
     final_dim: int = field(
@@ -149,7 +151,9 @@ class HubertConfig(FairseqDataclass):
     )
     mask_min_space: int = field(
         default=1,
-        metadata={"help": "min space between spans (if no overlap is enabled)"},
+        metadata={
+            "help": "min space between spans (if no overlap is enabled)"
+        },
     )
 
     # channel masking
@@ -179,17 +183,23 @@ class HubertConfig(FairseqDataclass):
     )
     mask_channel_min_space: int = field(
         default=1,
-        metadata={"help": "min space between spans (if no overlap is enabled)"},
+        metadata={
+            "help": "min space between spans (if no overlap is enabled)"
+        },
     )
 
     # positional embeddings
     conv_pos: int = field(
         default=128,
-        metadata={"help": "number of filters for convolutional positional embeddings"},
+        metadata={
+            "help": "number of filters for convolutional positional embeddings"
+        },
     )
     conv_pos_groups: int = field(
         default=16,
-        metadata={"help": "number of groups for convolutional positional embedding"},
+        metadata={
+            "help": "number of groups for convolutional positional embedding"
+        },
     )
 
     latent_temp: Tuple[float, float, float] = field(
@@ -207,35 +217,57 @@ class HubertConfig(FairseqDataclass):
         metadata={"help": "skip computing losses over unmasked frames"},
     )
 
-    checkpoint_activations: bool = field(
-        default=False,
-        metadata={"help": "recompute activations and save memory for extra compute"},
+    # speaker aware
+    spk_aware: bool = field(
+        default=False, metadata={"help": "use speaker aware training"},
+    )
+    spk_embed: int = field(
+        default=256, metadata={"help": "speaker embedding dimension"},
+    )
+    spk_method: str = field(
+        default='cat', metadata={"help": "the method to inform the network"},
+    )
+    spk_layers: str = field(
+        default='0', metadata={"help": "list of speaker aware layers"},
+    )
+    cat_layers: str = field(
+        default='0', metadata={"help": "list of layers to cat speaker embeddings"},
+    )
+    keep_spk_layers: bool = field(
+        default=False, metadata={"help": "always keep the speaker aware layers in layer dropout"},
+    )
+    init_linear: bool = field(
+        default=False, metadata={"help": "whether to initialize the linear layer"},
+    )
+    ln_after_adapt: bool = field(
+        default=False, metadata={"help": "Layer norm after the speaker adaptation"},
+    )
+    cln: bool = field(
+        default=False, metadata={"help": "Conditional layer norm"},
+    )
+    cln_bias: bool = field(
+        default=False, metadata={"help": "Modulate bias term in conditional layer norm"},
+    )
+    cattn: bool = field(
+        default=False, metadata={"help": "Conditional self-attention"},
     )
 
-    # FP16 optimization
-    required_seq_len_multiple: int = field(
-        default=2,
-        metadata={
-            "help": "pad the input to encoder such that the sequence length is divisible by multiple"
-        },
+    # adapter module
+    add_adapter: bool = field(
+        default=False, metadata={"help": "whether to add the adapter"},
     )
-
-    # Conformer
-    depthwise_conv_kernel_size: int = field(
-        default=31,
-        metadata={
-            "help": "depthwise-conv-kernel-size for convolution in conformer layer"
-        },
+    adapter_size: int = field(
+        default=256, metadata={"help": "size of adapter"},
     )
-    attn_type: str = field(
-        default="",
-        metadata={"help": "if espnet use ESPNET MHA"},
+    adapter_act: str = field(
+        default='swish', metadata={"help": "activation function of adapter"},
     )
-    pos_enc_type: str = field(
-        default="abs",
-        metadata={"help": "Positional encoding type to use in conformer"},
+    adapter_init_range: float = field(
+        default=1e-3, metadata={"help": "adapter initialization range"},
     )
-    fp16: bool = field(default=False, metadata={"help": "If fp16 is being used"})
+    adapter_method: str = field(
+        default='standard', metadata={"help": "adapter method"},
+    )
 
 
 @register_model("hubert", dataclass=HubertConfig)
@@ -259,7 +291,9 @@ class HubertModel(BaseFairseqModel):
             conv_bias=cfg.conv_bias,
         )
         feature_ds_rate = np.prod([s for _, _, s in feature_enc_layers])
-        self.feat2tar_ratio = cfg.label_rate * feature_ds_rate / task_cfg.sample_rate
+        self.feat2tar_ratio = (
+            cfg.label_rate * feature_ds_rate / task_cfg.sample_rate
+        )
 
         self.post_extract_proj = (
             nn.Linear(self.embed, cfg.encoder_embed_dim)
@@ -289,13 +323,20 @@ class HubertModel(BaseFairseqModel):
         self.skip_masked = cfg.skip_masked
         self.skip_nomask = cfg.skip_nomask
 
-        final_dim = cfg.final_dim if cfg.final_dim > 0 else cfg.encoder_embed_dim
+        final_dim = (
+            cfg.final_dim if cfg.final_dim > 0 else cfg.encoder_embed_dim
+        )
 
         self.mask_emb = nn.Parameter(
             torch.FloatTensor(cfg.encoder_embed_dim).uniform_()
         )
 
-        self.encoder = TransformerEncoder(cfg)
+        self.spk_aware = cfg.spk_aware
+        if not cfg.spk_aware:
+            self.encoder = TransformerEncoder(cfg)
+        else:
+            self.encoder = SpkAwareTransformerEncoder(cfg)
+
         self.layer_norm = LayerNorm(self.embed)
 
         self.target_glu = None
@@ -314,7 +355,9 @@ class HubertModel(BaseFairseqModel):
 
         # modules below are not needed during fine-tuning
         if any([d is None for d in dictionaries]):
-            logger.info("cannot find dictionary. assume will be used for fine-tuning")
+            logger.info(
+                "cannot find dictionary. assume will be used for fine-tuning"
+            )
         else:
             self.num_classes = [len(d) for d in dictionaries]
             self.label_embs_concat = nn.Parameter(
@@ -380,7 +423,9 @@ class HubertModel(BaseFairseqModel):
         pos = pos.unsqueeze(0)
         targets = torch.cat([pos, negs], dim=0)
 
-        logits = torch.cosine_similarity(x.float(), targets.float(), dim=-1).type_as(x)
+        logits = torch.cosine_similarity(
+            x.float(), targets.float(), dim=-1
+        ).type_as(x)
         logits /= self.logit_temp
         if neg_is_pos.any():
             logits[1:][neg_is_pos] = float("-inf")
@@ -398,9 +443,7 @@ class HubertModel(BaseFairseqModel):
         return features
 
     def forward_targets(
-        self,
-        features: torch.Tensor,
-        target_list: List[torch.Tensor],
+        self, features: torch.Tensor, target_list: List[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Trim features to ensure labels exist and then get aligned labels
         feat_tsz = features.size(2)
@@ -413,14 +456,14 @@ class HubertModel(BaseFairseqModel):
         return features, target_list
 
     def forward_padding_mask(
-        self,
-        features: torch.Tensor,
-        padding_mask: torch.Tensor,
+        self, features: torch.Tensor, padding_mask: torch.Tensor,
     ) -> torch.Tensor:
         extra = padding_mask.size(1) % features.size(1)
         if extra > 0:
             padding_mask = padding_mask[:, :-extra]
-        padding_mask = padding_mask.view(padding_mask.size(0), features.size(1), -1)
+        padding_mask = padding_mask.view(
+            padding_mask.size(0), features.size(1), -1
+        )
         padding_mask = padding_mask.all(-1)
         return padding_mask
 
@@ -429,8 +472,10 @@ class HubertModel(BaseFairseqModel):
         source: torch.Tensor,
         target_list: Optional[List[torch.Tensor]] = None,
         padding_mask: Optional[torch.Tensor] = None,
+        embed: Optional[torch.Tensor] = None,
         mask: bool = True,
         features_only: bool = False,
+        return_layer_results: bool = False,
         output_layer: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         """output layer is 1-based"""
@@ -454,7 +499,9 @@ class HubertModel(BaseFairseqModel):
         unmasked_features = self.dropout_features(unmasked_features)
 
         if mask:
-            x, mask_indices = self.apply_mask(features, padding_mask, target_list)
+            x, mask_indices = self.apply_mask(
+                features, padding_mask, target_list
+            )
         else:
             x = features
             mask_indices = None
@@ -464,11 +511,38 @@ class HubertModel(BaseFairseqModel):
         # x: (B, T, D), float
         # padding_mask: (B, T), bool
         # mask_indices: (B, T), bool
-        x, _ = self.encoder(
-            x,
-            padding_mask=padding_mask,
-            layer=None if output_layer is None else output_layer - 1,
-        )
+        layer_results = None
+        if not self.spk_aware:
+            if not return_layer_results:
+                x, _ = self.encoder(
+                    x,
+                    padding_mask=padding_mask,
+                    layer=None if output_layer is None else output_layer - 1
+                )
+            else:
+                x, layer_results = self.encoder(
+                    x,
+                    padding_mask=padding_mask,
+                    layer=None if output_layer is None else output_layer - 1
+                )
+        else:
+            if not return_layer_results:
+                x, _ = self.encoder(
+                    x,
+                    padding_mask=padding_mask,
+                    embed=embed,
+                    layer=None if output_layer is None else output_layer - 1
+                )
+            else:
+                x, layer_results = self.encoder(
+                    x,
+                    padding_mask=padding_mask,
+                    embed=embed,
+                    layer=None if output_layer is None else output_layer - 1
+                )
+
+        if return_layer_results:
+            return {"x": x, "layer_results": layer_results, "padding_mask": padding_mask, "features": features}
 
         if features_only:
             return {"x": x, "padding_mask": padding_mask, "features": features}
@@ -496,7 +570,9 @@ class HubertModel(BaseFairseqModel):
                 proj_x_m_list = [proj_x_m for _ in range(len(target_list))]
             logit_m_list = [
                 compute_pred(proj_x_m, t[masked_indices], label_embs_list[i])
-                for i, (proj_x_m, t) in enumerate(zip(proj_x_m_list, target_list))
+                for i, (proj_x_m, t) in enumerate(
+                    zip(proj_x_m_list, target_list)
+                )
             ]
         else:
             logit_m_list = [None for _ in target_list]
@@ -511,7 +587,9 @@ class HubertModel(BaseFairseqModel):
 
             logit_u_list = [
                 compute_pred(proj_x_u, t[nomask_indices], label_embs_list[i])
-                for i, (proj_x_u, t) in enumerate(zip(proj_x_u_list, target_list))
+                for i, (proj_x_u, t) in enumerate(
+                    zip(proj_x_u_list, target_list)
+                )
             ]
         else:
             logit_u_list = [None for _ in target_list]
@@ -528,6 +606,7 @@ class HubertModel(BaseFairseqModel):
         self,
         source: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
+        embed: Optional[torch.Tensor] = None,
         mask: bool = False,
         ret_conv: bool = False,
         output_layer: Optional[int] = None,
@@ -535,6 +614,7 @@ class HubertModel(BaseFairseqModel):
         res = self.forward(
             source,
             padding_mask=padding_mask,
+            embed=embed,
             mask=mask,
             features_only=True,
             output_layer=output_layer,
@@ -552,7 +632,9 @@ class HubertModel(BaseFairseqModel):
 
     def get_targets(self, net_output, is_masked=True):
         logits_list = self.get_logits(net_output, is_masked)
-        targets_list = [x.new_zeros(x.size(0), dtype=torch.long) for x in logits_list]
+        targets_list = [
+            x.new_zeros(x.size(0), dtype=torch.long) for x in logits_list
+        ]
         return targets_list
 
     def get_extra_losses(self, net_output):
