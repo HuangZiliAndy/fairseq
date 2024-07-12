@@ -381,7 +381,8 @@ class HubertEncoder(FairseqEncoder):
         self.freeze_finetune_updates = cfg.freeze_finetune_updates
         self.num_updates = 0
 
-        if task.target_dictionary is not None and not cfg.autoregressive:
+        #if task.target_dictionary is not None and not cfg.autoregressive:
+        if task.target_dictionary is not None:
             self.proj = Linear(d, len(task.target_dictionary))
         elif getattr(cfg, "decoder_embed_dim", d) != d:
             self.proj = Linear(d, cfg.decoder_embed_dim)

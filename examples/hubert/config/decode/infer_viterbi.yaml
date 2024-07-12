@@ -6,15 +6,16 @@ defaults:
 hydra:
   run:
     dir: ${common_eval.results_path}/viterbi
-  sweep:
-    dir: ${common_eval.results_path}
-    subdir: viterbi
+#sweep:
+#  dir: ${common_eval.results_path}
+#  subdir: viterbi
 
 task:
   _name: hubert_pretraining
   single_target: true
   fine_tuning: true
   data: ???
+  label_dir: ???
   normalize: ???
 
 decoding:
@@ -27,3 +28,5 @@ common_eval:
 dataset:
   max_tokens: 1100000
   gen_subset: ???
+  batch_size: 1
+  num_workers: 4
