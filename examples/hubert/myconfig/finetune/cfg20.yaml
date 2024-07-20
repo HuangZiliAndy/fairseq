@@ -1,0 +1,90 @@
+# @package _group_
+
+common:
+  fp16: true
+  log_format: json
+  log_interval: 200
+  tensorboard_logdir: tblog
+  seed: 1337
+
+checkpoint:
+  save_interval_updates: 5000
+  keep_interval_updates: 1
+  no_epoch_checkpoints: true
+  best_checkpoint_metric: wer
+
+distributed_training:
+  ddp_backend: c10d
+  find_unused_parameters: true
+  distributed_world_size: 1
+  distributed_port: 29671
+  nprocs_per_node: 1
+
+task:
+  _name: hubert_pretraining
+  data: ???
+  fine_tuning: true
+  label_dir: ???
+  normalize: false  # must be consistent with pre-training
+  labels: ["ltr"]
+  single_target: true
+  min_sample_size: 8000
+
+dataset:
+  num_workers: 6
+  max_tokens: 6400000
+  validate_after_updates: 0
+  validate_interval_updates: 2000
+  train_subset: train
+  valid_subset: dev
+
+criterion:
+  _name: ctc
+  zero_infinity: true
+
+optimization:
+  max_update: 50000
+  lr: [1e-4]
+  sentence_avg: true
+  update_freq: [1]
+
+optimizer:
+  _name: adam
+  adam_betas: (0.9,0.98)
+  adam_eps: 1e-08
+
+lr_scheduler:
+  _name: tri_stage
+  phase_ratio: [0.1, 0.4, 0.5]
+  final_lr_scale: 0.05
+
+model:
+  _name: wavlm_ctc
+  model_name: "microsoft/wavlm-base-plus"
+  cache_dir: "/export/c12/hzili1/workspace/Amazon/fairseq/examples/hubert/huggingface_models"
+  use_lora: true
+  lora_r: 32
+  lora_alpha: 16
+  lora_dropout: 0.1 
+  target_modules: "q_proj,v_proj,k_proj,out_proj"
+  freeze_layer_norm: true
+
+hydra:
+  job:
+    config:
+      override_dirname:
+        kv_sep: '-'
+        item_sep: '__'
+        exclude_keys:
+          - run
+          - task.data
+          - task.label_dir
+          - dataset.train_subset
+          - dataset.valid_subset
+          - criterion.wer_kenlm_model
+          - criterion.wer_lexicon
+  run:
+    dir: ???
+  sweep:
+    dir: ???
+    subdir: ${hydra.job.config_name}__${hydra.job.override_dirname}

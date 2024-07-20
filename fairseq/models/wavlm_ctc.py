@@ -63,6 +63,15 @@ class WavlmAsrConfig(FairseqDataclass):
         default=0.1,
         metadata={"help": "LoRA dropout"},
     )
+    target_modules: str = field(
+        default="q_proj,v_proj",
+        metadata={"help": "Target modules"},
+    )
+    freeze_layer_norm: bool = field(
+        default=False,
+        metadata={"help": "whether to freeze the layer norm"},
+    )
+
     
 
 @register_model("wavlm_ctc", dataclass=WavlmAsrConfig)
@@ -82,11 +91,19 @@ class WavlmCtc(BaseFairseqModel):
         self.model = WavLMForCTC(self.wavlm_model.config)
         self.model.wavlm = self.wavlm_model
 
+        target_modules = cfg.target_modules.split(',')
+
         if cfg.use_lora:
             peft_config = LoraConfig(
-                target_modules=["q_proj", "v_proj"], r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout, modules_to_save=["lm_head"]
+                target_modules=target_modules, r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout,
             )
             self.model = get_peft_model(self.model, peft_config)
+
+        for name, param in self.model.named_parameters():
+            if "lm_head" in name:
+                param.requires_grad = True
+            if not cfg.freeze_layer_norm and "layer_norm" in name:
+                param.requires_grad = True
 
         # Print trainable and frozen parameters
         trainable_params, frozen_params = [], []
