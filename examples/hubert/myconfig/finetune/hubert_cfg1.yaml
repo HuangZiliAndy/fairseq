@@ -59,15 +59,23 @@ lr_scheduler:
   final_lr_scale: 0.05
 
 model:
-  _name: wavlm_ctc
-  model_name: "microsoft/wavlm-base-plus"
-  cache_dir: "/scratch4/lgarci27/hzili1/workspace/huggingface_models"
-  use_lora: true
-  lora_r: 32
-  lora_alpha: 16
-  lora_dropout: 0.1 
-  target_modules: "intermediate_dense,output_dense"
-  freeze_layer_norm: false
+  _name: hubert_ctc
+  w2v_path: ???
+  apply_mask: false
+  mask_prob: 0.65
+  mask_selection: static
+  mask_length: 10
+  mask_other: 0
+  mask_channel_selection: static
+  mask_channel_other: 0
+  mask_channel_prob: 0.5
+  mask_channel_length: 64
+  layerdrop: 0.1
+  dropout: 0.0
+  activation_dropout: 0.1
+  attention_dropout: 0.0
+  feature_grad_mult: 0.0
+  freeze_finetune_updates: 0
 
 hydra:
   job:
@@ -79,6 +87,7 @@ hydra:
           - run
           - task.data
           - task.label_dir
+          - model.w2v_path
           - dataset.train_subset
           - dataset.valid_subset
           - criterion.wer_kenlm_model

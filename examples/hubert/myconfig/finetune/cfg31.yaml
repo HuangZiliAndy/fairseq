@@ -32,7 +32,7 @@ task:
 
 dataset:
   num_workers: 6
-  max_tokens: 6400000
+  max_tokens: 3200000
   validate_after_updates: 0
   validate_interval_updates: 2000
   train_subset: train
@@ -46,7 +46,8 @@ optimization:
   max_update: 50000
   lr: [1e-4]
   sentence_avg: true
-  update_freq: [1]
+  update_freq: [2]
+  clip_norm: 5.0
 
 optimizer:
   _name: adam
@@ -62,12 +63,11 @@ model:
   _name: wavlm_ctc
   model_name: "microsoft/wavlm-base-plus"
   cache_dir: "/scratch4/lgarci27/hzili1/workspace/huggingface_models"
-  use_lora: true
-  lora_r: 32
-  lora_alpha: 16
-  lora_dropout: 0.1 
-  target_modules: "intermediate_dense,output_dense"
+  use_lora: false
   freeze_layer_norm: false
+  enh_model_type: DPTNet
+  enh_model_path: "/scratch4/lgarci27/hzili1/workspace/Amazon/asteroid/egs/librimix/DPTNet/exp/cfg1/best_model.pth"
+  freeze_enh_model: true
 
 hydra:
   job:

@@ -11,7 +11,8 @@ checkpoint:
   save_interval_updates: 5000
   keep_interval_updates: 1
   no_epoch_checkpoints: true
-  best_checkpoint_metric: wer
+  best_checkpoint_metric: si_sdri
+  maximize_best_checkpoint_metric: true
 
 distributed_training:
   ddp_backend: c10d
@@ -21,31 +22,51 @@ distributed_training:
   nprocs_per_node: 1
 
 task:
-  _name: hubert_pretraining
-  data: ???
-  fine_tuning: true
-  label_dir: ???
-  normalize: false  # must be consistent with pre-training
-  labels: ["ltr"]
-  single_target: true
-  min_sample_size: 8000
+  _name: enhancement
+  data_dir: /data/lgarci27/hzili1/workspace/s3prl_csp/s3prl/downstream/sep_ami/data/ami
+  RIR_dir: /data/lgarci27/hzili1/workspace/s3prl_csp/s3prl/downstream/sep_ami/data/ami/AMI_RIRs_3srcs
+  noise_dir: /data/lgarci27/hzili1/datasets/wham_noise
+  add_reverb: true
+  add_noise: true 
+  full_overlap: false
+  s1_first: false
+  s1_only: true
+  crop_dur: 20.0
+  max_num_spk: 1
+  min_num_spk: 1 
+  min_sir: 5
+  max_sir: 20
+  min_snr: 5
+  max_snr: 20
+  rate: 16000
+  n_fft: 512
+  hop_length: 160
+  win_length: 400
+  chunk_size: 4.0
+  normalize: true
+  target: direct
 
 dataset:
   num_workers: 6
-  max_tokens: 6400000
+  batch_size: 32
+  batch_size_valid: 1
   validate_after_updates: 0
   validate_interval_updates: 2000
   train_subset: train
   valid_subset: dev
 
 criterion:
-  _name: ctc
-  zero_infinity: true
+  _name: enh
+  mask_type: PSM
+  loss_type: L1
+  n_fft: ${task.n_fft}
+  hop_length: ${task.hop_length}
+  win_length: ${task.win_length}
 
 optimization:
   max_update: 50000
   lr: [1e-4]
-  sentence_avg: true
+  sentence_avg: false
   update_freq: [1]
 
 optimizer:
@@ -59,15 +80,11 @@ lr_scheduler:
   final_lr_scale: 0.05
 
 model:
-  _name: wavlm_ctc
-  model_name: "microsoft/wavlm-base-plus"
-  cache_dir: "/scratch4/lgarci27/hzili1/workspace/huggingface_models"
-  use_lora: true
-  lora_r: 32
-  lora_alpha: 16
-  lora_dropout: 0.1 
-  target_modules: "intermediate_dense,output_dense"
-  freeze_layer_norm: false
+  _name: enh_transformer 
+  setup: tiny
+  n_fft: ${task.n_fft}
+  activation: none
+  log1p: true
 
 hydra:
   job:
@@ -77,12 +94,8 @@ hydra:
         item_sep: '__'
         exclude_keys:
           - run
-          - task.data
-          - task.label_dir
           - dataset.train_subset
           - dataset.valid_subset
-          - criterion.wer_kenlm_model
-          - criterion.wer_lexicon
   run:
     dir: ???
   sweep:

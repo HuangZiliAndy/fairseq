@@ -61,7 +61,7 @@ lr_scheduler:
 model:
   _name: wavlm_ctc
   model_name: "microsoft/wavlm-base-plus"
-  cache_dir: "/export/c12/hzili1/workspace/Amazon/fairseq/examples/hubert/huggingface_models"
+  cache_dir: "/scratch4/lgarci27/hzili1/workspace/huggingface_models"
   use_lora: true
   lora_r: 32
   lora_alpha: 16

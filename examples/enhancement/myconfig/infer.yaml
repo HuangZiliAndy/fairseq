@@ -1,0 +1,38 @@
+# @package _group_
+
+defaults:
+  - model: null
+
+hydra:
+  run:
+    dir: ${common_eval.results_path}/predictions
+#sweep:
+#  dir: ${common_eval.results_path}
+#  subdir: viterbi
+
+task:
+  _name: enhancement
+  otf_data_simu: false
+  data_dir: /scratch4/lgarci27/hzili1/workspace/Amazon/fairseq/examples/enhancement/dataset/
+  crop_dur: 20.0
+  rate: 16000
+  n_fft: 512
+  hop_length: 160
+  win_length: 400
+  chunk_size: -1
+  target: direct
+
+common_eval:
+  results_path: ???
+  path: ???
+
+dataset:
+  max_tokens: 1100000
+  gen_subset: ???
+  batch_size: 1
+  num_workers: 4
+
+common:
+  seed: 7
+
+save_audio: true
